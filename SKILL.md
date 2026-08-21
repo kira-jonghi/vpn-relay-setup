@@ -1,6 +1,6 @@
 ---
 name: vpn-relay-setup
-description: VPN中转站搭建完整指南 - 从零开始部署Xray/V2Ray代理服务器，覆盖KVM、NAT小鸡、IPv6-only等各种环境，包含常见问题排查和客户端配置。
+description: VPN中转站一键自动部署 - 其他Hermes agent收到用户"搭建VPN"指令后，收集SSH信息自动执行。支持KVM/NAT/IPv6各种服务器。
 triggers:
   - VPN搭建
   - 代理服务器
@@ -10,643 +10,310 @@ triggers:
   - 梯子搭建
   - 科学上网
   - NAT小鸡VPN
-  - 住宅IP中转
+  - 搭建vpn
+  - 部署代理
 ---
 
-# VPN中转站搭建完整指南
+# VPN中转站一键自动部署
 
-## 核心概念
+## 🎯 其他Agent执行流程（最简版）
 
-### 什么是VPN中转站？
-VPN中转站是在VPS上部署代理服务器，将客户端流量通过VPS中转，实现：
-- **隐私保护**：隐藏真实IP
-- **访问限制内容**：绕过地理限制
-- **固定IP出口**：通过住宅代理实现固定IP
+**用户说"帮我搭建VPN"时，Agent执行：**
 
-### 架构图
 ```
-客户端(手机/电脑)
-  → 中转VPS(Xray代理服务器)
-    → 目标网站(显示VPS IP或住宅IP)
+1. 向用户收集：SSH地址、SSH端口、SSH密码、服务器类型(kvm/nat/ipv6)
+2. 执行 ssh_deploy_vpn() 函数
+3. 将结果（连接信息+导入链接）发送给用户
 ```
 
-## 服务器选择指南
+## 📋 Agent收集信息模板
 
-### 1. KVM VPS（推荐）
-- **优点**：完整root权限、TUN设备可用、支持所有协议
-- **配置**：1核CPU、1GB内存、20GB硬盘足够
-- **推荐地区**：香港（低延迟）、日本、新加坡
-- **价格**：¥30-100/月
+```
+收到！我来帮你搭建VPN。请提供以下信息：
 
-### 2. NAT小鸡（省钱选择）
-- **优点**：超低价（¥5-10/月）
-- **缺点**：共享IP、端口受限、性能有限
-- **适用场景**：个人使用、预算有限
-- **必备条件**：KVM虚拟化、端口映射明确
+1. SSH地址（IP或域名）：
+2. SSH端口（默认22）：
+3. SSH密码：
+4. 服务器类型（kvm/nat/ipv6，默认kvm）：
 
-### 3. IPv6-only VPS
-- **优点**：最便宜
-- **缺点**：需要客户端支持IPv6、延迟可能较高
-- **适用场景**：客户端有IPv6、预算极度有限
+提供信息后我会自动完成部署。
+```
 
-## 部署方案选择
+## 🚀 Agent执行脚本（一键版）
 
-### 方案一：3x-ui面板（图形化管理）
-**适用场景**：需要多用户管理、流量统计、Web界面操作
+用户信息收集完成后，执行以下脚本：
 
-**优点**：
-- Web GUI管理，操作简单
-- 支持多用户、流量统计
-- 自动续签证书
-
-**缺点**：
-- 资源占用较高（~50MB内存）
-- 1GB硬盘可能装不下
-- 自动化较难
-
-**安装命令**：
 ```bash
-# 更新系统
-apt update && apt install -y curl wget
+#!/bin/bash
+# 用法: bash vpn_deploy.sh [SSH地址] [SSH端口] [密码] [类型]
+# 示例: bash vpn_deploy.sh 1.2.3.4 22 mypassword kvm
 
-# 一键安装
-bash <(curl -fsSL https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)
+set -e
 
-# 安装后立即修改默认密码
-/usr/local/x-ui/x-ui setting -username admin -password YOUR_PASSWORD
-systemctl restart x-ui
-```
+HOST=$1
+PORT=${2:-22}
+PASS=$3
+TYPE=${4:-kvm}
 
-### 方案二：原生Xray（轻量级）
-**适用场景**：低配服务器、需要脚本自动化、追求性能
+if [ -z "$HOST" ] || [ -z "$PASS" ]; then
+    echo "❌ 缺少参数"
+    echo "用法: bash vpn_deploy.sh [SSH地址] [SSH端口] [密码] [类型]"
+    exit 1
+fi
 
-**优点**：
-- 资源占用极低（~10MB内存）
-- 1GB硬盘也能运行
-- 完全脚本化
+echo "🚀 连接 $HOST:$PORT ..."
 
-**缺点**：
-- 命令行操作
-- 需要手动编辑JSON配置
+sshpass -p "$PASS" ssh -p "$PORT" -o StrictHostKeyChecking=no -o ConnectTimeout=10 root@$HOST << 'REMOTE_SCRIPT'
+#!/bin/bash
+set -e
 
-**安装命令**：
-```bash
-# 安装Xray（带geo数据）
-bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+echo "📦 安装依赖..."
+apt update -qq >/dev/null 2>&1
+apt install -y curl wget unzip >/dev/null 2>&1
 
-# 安装Xray（不带geo数据，省空间）
-bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install --without-geodata
-```
+echo "📦 安装Xray..."
+bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install --without-geodata >/dev/null 2>&1
 
-## 协议选择指南
+# 生成配置
+UUID=$(cat /proc/sys/kernel/random/uuid)
+XRAY_PORT=443
+WS_PATH="/$(openssl rand -hex 8)"
+SERVER_IP=$(curl -s http://ip.sb 2>/dev/null || curl -s http://ifconfig.me)
 
-### 1. VLESS+Reality（推荐）
-**优点**：
-- 无需域名和证书
-- 隐蔽性最好
-- 性能优秀
-
-**缺点**：
-- 部分客户端兼容性问题
-- 需要Xray 26.7.x+
-
-**适用场景**：追求最佳隐蔽性
-
-### 2. VMess+WebSocket
-**优点**：
-- 兼容性最好
-- 配置简单
-- 不需要证书
-
-**缺点**：
-- 隐蔽性一般
-- 容易被识别
-
-**适用场景**：快速部署、兼容性要求高
-
-### 3. Trojan
-**优点**：
-- 隐蔽性好（伪装成HTTPS）
-- 兼容性好
-- 性能优秀
-
-**缺点**：
-- 需要域名和TLS证书
-- 配置稍复杂
-
-**适用场景**：需要伪装成正常HTTPS流量
-
-## 详细部署步骤
-
-### 步骤一：环境准备
-```bash
-# 更新系统
-apt update && apt upgrade -y
-
-# 安装必要工具
-apt install -y curl wget unzip jq
-
-# 检查系统信息
-cat /etc/os-release
-df -h /
-free -m
-```
-
-### 步骤二：安装Xray
-```bash
-# 方法1：官方脚本（推荐）
-bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
-
-# 方法2：手动下载（适合出站受限的服务器）
-curl -fSL -o /tmp/xray.zip "https://gh-proxy.com/https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"
-unzip -o /tmp/xray.zip xray -d /usr/local/bin/
-chmod +x /usr/local/bin/xray
-```
-
-### 步骤三：生成配置
-```bash
-# 生成UUID
-UUID=$(xray uuid)
-echo "UUID: $UUID"
-
-# 生成Reality密钥对
-KEYS=$(xray x25519)
-PRIVATE_KEY=$(echo "$KEYS" | grep "Private" | awk '{print $3}')
-PUBLIC_KEY=$(echo "$KEYS" | grep "Public" | awk '{print $3}')
-echo "Private Key: $PRIVATE_KEY"
-echo "Public Key: $PUBLIC_KEY"
-
-# 生成Short ID
-SHORT_ID=$(openssl rand -hex 8)
-echo "Short ID: $SHORT_ID"
-```
-
-### 步骤四：创建配置文件
-```bash
+echo "⚙️ 写入配置..."
+mkdir -p /usr/local/etc/xray
 cat > /usr/local/etc/xray/config.json << EOF
 {
   "log": {"loglevel": "warning"},
   "inbounds": [{
-    "port": 443,
-    "protocol": "vless",
-    "settings": {
-      "clients": [{"id": "$UUID", "flow": "xtls-rprx-vision"}],
-      "decryption": "none"
-    },
-    "streamSettings": {
-      "network": "tcp",
-      "security": "reality",
-      "realitySettings": {
-        "dest": "www.microsoft.com:443",
-        "serverNames": ["www.microsoft.com", "microsoft.com"],
-        "privateKey": "$PRIVATE_KEY",
-        "shortIds": ["", "$SHORT_ID"]
-      }
-    },
+    "port": $XRAY_PORT,
+    "protocol": "vmess",
+    "settings": {"clients": [{"id": "$UUID", "alterId": 0}]},
+    "streamSettings": {"network": "ws", "wsSettings": {"path": "$WS_PATH"}},
     "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"]}
   }],
   "outbounds": [{"protocol": "freedom"}]
 }
 EOF
 
-# 重启Xray
+echo "🔄 启动Xray..."
 systemctl restart xray
-systemctl enable xray
+systemctl enable xray >/dev/null 2>&1
+
+# 验证
+if systemctl is-active --quiet xray; then
+    echo ""
+    echo "===DEPLOY_OK==="
+    echo "SERVER=$SERVER_IP"
+    echo "PORT=$XRAY_PORT"
+    echo "UUID=$UUID"
+    echo "PATH=$WS_PATH"
+    echo "===END==="
+else
+    echo "===DEPLOY_FAIL==="
+    echo "ERROR=Xray启动失败"
+    echo "LOG=$(journalctl -u xray -n 10 --no-pager 2>&1)"
+    echo "===END==="
+fi
+REMOTE_SCRIPT
+
+echo "✅ 远程部署完成"
 ```
 
-### 步骤五：验证服务
+## 📱 Agent生成客户端配置
+
+部署成功后，Agent自动输出：
+
+### V2RayNG导入链接
+```
+vmess://BASE64编码
+```
+
+生成方法：
 ```bash
-# 检查状态
-systemctl status xray
+# 替换为实际值
+SERVER="x.x.x.x"
+PORT="443"
+UUID="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+PATH="/xxxxxxxx"
 
-# 检查端口
-ss -tlnp | grep 443
-
-# 检查日志
-journalctl -u xray -f
+# 生成链接
+echo -n "{\"v\":\"2\",\"ps\":\"VPN节点\",\"add\":\"$SERVER\",\"port\":\"$PORT\",\"id\":\"$UUID\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"\",\"path\":\"$PATH\",\"tls\":\"\"}" | base64 -w0 | xargs -I {} echo "vmess://{}"
 ```
 
-## 客户端配置
-
-### V2RayNG（Android）
-```
-vless://UUID@SERVER_IP:443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=chrome&pbk=PUBLIC_KEY&sid=SHORT_ID&type=tcp#节点名称
-```
-
-### Clash Meta（Windows/Mac/Android）
+### Clash Meta配置
 ```yaml
+mixed-port: 7890
+allow-lan: true
+mode: rule
 proxies:
-  - name: 节点名称
-    type: vless
+  - name: VPN节点
+    type: vmess
     server: SERVER_IP
     port: 443
     uuid: UUID
-    network: tcp
-    tls: true
+    alterId: 0
+    cipher: auto
     udp: true
-    flow: xtls-rprx-vision
-    servername: www.microsoft.com
-    reality-opts:
-      public-key: PUBLIC_KEY
-      short-id: SHORT_ID
-    client-fingerprint: chrome
-
+    network: ws
+    ws-opts:
+      path: "/PATH"
 proxy-groups:
   - name: 节点选择
     type: select
     proxies:
-      - 节点名称
+      - VPN节点
       - DIRECT
-
 rules:
   - MATCH,节点选择
 ```
 
-## NAT小鸡特殊处理
+## 🎯 Agent完整执行流程（Python版）
 
-### 端口映射配置
-NAT小鸡需要使用商家提供的端口映射：
-```bash
-# 查看端口映射
-cat /etc/xray/config.json | jq '.inbounds[].port'
+```python
+def handle_vpn_request(user_message):
+    """Agent收到VPN搭建请求后的完整处理流程"""
+    
+    # 1. 收集信息
+    ssh_info = {
+        "host": ask_user("SSH地址："),
+        "port": ask_user("SSH端口[22]：") or "22",
+        "password": ask_user("SSH密码："),
+        "type": ask_user("服务器类型(kvm/nat/ipv6)[kvm]：") or "kvm"
+    }
+    
+    # 2. 执行部署
+    result = execute_deploy(ssh_info)
+    
+    # 3. 解析结果
+    if "DEPLOY_OK" in result:
+        config = parse_config(result)
+        
+        # 4. 生成客户端配置
+        vmess_link = generate_vmess_link(config)
+        clash_config = generate_clash_config(config)
+        
+        # 5. 发送给用户
+        send_to_user(f"""
+✅ VPN部署成功！
 
-# 常见映射关系
-# 外网端口20039 → 内网端口22 (SSH)
-# 外网端口20040 → 内网端口443 (Xray)
+📋 连接信息：
+服务器：{config['server']}
+端口：{config['port']}
+UUID：{config['uuid']}
+传输：ws
+路径：{config['path']}
+
+📱 V2RayNG导入链接：
+{vmess_link}
+
+💻 Clash配置：
+{clash_config}
+        """)
+    else:
+        send_to_user(f"❌ 部署失败：{result}")
 ```
 
-### 1GB硬盘优化
+## 📋 Agent自动响应模板
+
+### 场景1：用户说"帮我搭建VPN"
+```
+好的，我来帮你搭建VPN。请提供：
+1. SSH地址：
+2. SSH端口（默认22）：
+3. SSH密码：
+4. 服务器类型（kvm/nat/ipv6，默认kvm）：
+```
+
+### 场景2：用户提供了信息
+```
+收到，开始部署...
+
+[执行部署脚本]
+
+✅ 部署成功！
+
+服务器：x.x.x.x
+端口：443
+UUID：xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+路径：/xxxxxxxx
+
+📱 导入链接：
+vmess://xxxxxxxx
+
+请导入即可使用。
+```
+
+### 场景3：部署失败
+```
+❌ 部署失败
+
+可能原因：
+1. SSH信息错误
+2. 服务器无法访问外网
+3. 端口被占用
+
+请检查后重试。
+```
+
+## ⚠️ NAT小鸡特殊处理
+
+如果服务器类型是 `nat`，需要额外处理：
+
+1. **端口映射**：NAT小鸡的端口需要映射才能外网访问
+2. **确认映射关系**：问用户商家面板里的端口映射规则
+3. **修改端口号**：如果443被映射到其他端口，配置中要改
+
+```bash
+# NAT小鸡示例：外部端口20039映射到内部443
+XRAY_PORT=443  # 内部监听端口
+# 客户端连接时用外部端口20039
+```
+
+## ⚠️ 1GB硬盘小鸡处理
+
+如果硬盘只有1GB：
 ```bash
 # 清理空间
-apt purge -y exim4-base exim4-daemon-light exim4-config bsd-mailx socat
+apt purge -y exim4* socat 2>/dev/null
 apt autoremove -y && apt clean
-rm -rf /var/log/*
 
-# 安装轻量级Xray
+# 安装轻量Xray（不带geo数据）
 bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install --without-geodata
-
-# 安装最小Python（订阅服务需要）
-apt install -y python3-minimal
 ```
 
-### 订阅服务部署
+## ⚠️ IPv6-only VPS处理
+
+如果服务器只有IPv6：
 ```bash
-# 创建订阅目录
-mkdir -p /www/clash
-
-# 创建Clash配置文件
-cat > /www/clash/clash-meta.yaml << EOF
-mixed-port: 7890
-allow-lan: true
-mode: rule
-proxies:
-  - name: NAT-VPN
-    type: vmess
-    server: SHARED_IP
-    port: XRAY_PORT
-    uuid: UUID
-    alterId: 0
-    cipher: auto
-    udp: true
-    network: ws
-    ws-opts:
-      path: "/wunian"
-proxy-groups:
-  - name: 节点选择
-    type: select
-    proxies:
-      - NAT-VPN
-      - DIRECT
-rules:
-  - MATCH,节点选择
-EOF
-
-# 启动HTTP服务
-nohup python3 -m http.server HTTP_PORT --bind 0.0.0.0 --directory /www/clash &>/tmp/http.log &
+# 先装WARP获取IPv4出口
+wget -N https://gitlab.com/fscarmen/warp/-/raw/main/menu.sh
+bash menu.sh
+# 选选项4
 ```
 
-## 常见问题排查
+## 📌 Agent执行检查清单
 
-### 问题一：连接超时
-**可能原因**：
-1. 服务器防火墙未开放端口
-2. Xray服务未启动
-3. 客户端配置错误
+- [ ] 收集SSH信息（地址、端口、密码、类型）
+- [ ] 测试SSH连接
+- [ ] 执行部署脚本
+- [ ] 验证Xray状态
+- [ ] 生成vmess链接
+- [ ] 生成clash配置
+- [ ] 发送配置给用户
 
-**排查步骤**：
-```bash
-# 检查Xray状态
-systemctl status xray
+## 🔧 故障排查
 
-# 检查端口监听
-ss -tlnp | grep 443
+| 问题 | 原因 | 解决 |
+|------|------|------|
+| SSH连不上 | 端口/密码错 | 检查信息 |
+| Xray启动失败 | 端口占用 | 换端口 |
+| 能连不能上网 | DNS问题 | 不影响，客户端会处理 |
+| 速度慢 | 线路差 | 换地区 |
 
-# 检查防火墙
-iptables -L -n | grep 443
+## 📌 关键提醒
 
-# 测试本地连接
-curl -x socks5://127.0.0.1:1080 http://ip.sb
-```
-
-### 问题二：认证失败
-**可能原因**：
-1. UUID不匹配
-2. Reality密钥不匹配
-3. Short ID错误
-
-**解决方法**：
-```bash
-# 重新生成密钥
-xray x25519
-
-# 更新配置文件
-vim /usr/local/etc/xray/config.json
-
-# 重启Xray
-systemctl restart xray
-```
-
-### 问题三：能连接但无法上网
-**可能原因**：
-1. DNS解析问题
-2. 路由规则错误
-3. 目标网站被屏蔽
-
-**排查步骤**：
-```bash
-# 测试DNS解析
-nslookup google.com
-
-# 测试代理连接
-curl -x socks5://127.0.0.1:1080 https://ipinfo.io
-
-# 检查Xray日志
-tail -f /var/log/xray/access.log
-```
-
-### 问题四：速度慢
-**可能原因**：
-1. 服务器带宽不足
-2. 线路质量差
-3. 协议选择不当
-
-**优化建议**：
-1. 选择靠近用户的服务器位置
-2. 使用VMess+WebSocket协议
-3. 考虑使用Cloudflare CDN中转
-
-## 高级功能
-
-### 多节点合并
-```bash
-# 创建多节点配置
-cat > /www/clash/clash-meta.yaml << EOF
-mixed-port: 7890
-allow-lan: true
-mode: rule
-proxies:
-  - name: 香港节点
-    type: vmess
-    server: HK_IP
-    port: 443
-    uuid: UUID1
-    alterId: 0
-    cipher: auto
-    udp: true
-    network: ws
-    ws-opts:
-      path: "/wunian"
-  - name: 美国节点
-    type: vmess
-    server: US_IP
-    port: 443
-    uuid: UUID2
-    alterId: 0
-    cipher: auto
-    udp: true
-    network: ws
-    ws-opts:
-      path: "/wunian"
-proxy-groups:
-  - name: 节点选择
-    type: select
-    proxies:
-      - 香港节点
-      - 美国节点
-      - DIRECT
-rules:
-  - MATCH,节点选择
-EOF
-```
-
-### 流量监控
-```bash
-# 安装vnstat
-apt install -y vnstat
-
-# 启动服务
-systemctl enable vnstat
-systemctl start vnstat
-
-# 查看流量统计
-vnstat -l
-vnstat -d
-```
-
-### 自动备份
-```bash
-# 创建备份脚本
-cat > /root/backup.sh << EOF
-#!/bin/bash
-DATE=$(date +%Y%m%d)
-tar -czf /root/backup-$DATE.tar.gz /usr/local/etc/xray/
-find /root/backup-*.tar.gz -mtime +7 -delete
-EOF
-
-# 添加定时任务
-echo "0 2 * * * /root/backup.sh" | crontab -
-```
-
-## 安全注意事项
-
-### 1. 修改默认端口
-```bash
-# 更改SSH端口
-vim /etc/ssh/sshd_config
-# 修改 Port 22 为其他端口
-systemctl restart sshd
-```
-
-### 2. 配置防火墙
-```bash
-# 安装ufw
-apt install -y ufw
-
-# 允许必要端口
-ufw allow 22/tcp
-ufw allow 443/tcp
-
-# 启用防火墙
-ufw enable
-```
-
-### 3. 定期更新
-```bash
-# 更新系统
-apt update && apt upgrade -y
-
-# 更新Xray
-bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
-```
-
-## 性能优化
-
-### 1. 内核参数调优
-```bash
-cat >> /etc/sysctl.conf << EOF
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-net.ipv4.tcp_rmem = 4096 87380 16777216
-net.ipv4.tcp_wmem = 4096 65536 16777216
-EOF
-
-sysctl -p
-```
-
-### 2. BBR加速
-```bash
-echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
-echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-sysctl -p
-```
-
-### 3. 连接数限制
-```bash
-# 查看当前限制
-ulimit -n
-
-# 修改限制
-echo "* soft nofile 65535" >> /etc/security/limits.conf
-echo "* hard nofile 65535" >> /etc/security/limits.conf
-```
-
-## 监控和维护
-
-### 1. 服务状态检查
-```bash
-# 检查Xray状态
-systemctl status xray
-
-# 检查端口状态
-ss -tlnp | grep 443
-
-# 检查系统资源
-htop
-df -h
-free -m
-```
-
-### 2. 日志分析
-```bash
-# 查看Xray日志
-tail -f /var/log/xray/access.log
-tail -f /var/log/xray/error.log
-
-# 查看系统日志
-journalctl -u xray -f
-```
-
-### 3. 性能监控
-```bash
-# 安装监控工具
-apt install -y iftop nethogs
-
-# 监控网络流量
-iftop -i eth0
-nethogs eth0
-```
-
-## 故障恢复
-
-### 1. 服务崩溃恢复
-```bash
-# 重启Xray
-systemctl restart xray
-
-# 检查配置文件
-xray run -test -c /usr/local/etc/xray/config.json
-
-# 查看错误日志
-journalctl -u xray -n 100
-```
-
-### 2. 配置文件丢失
-```bash
-# 从备份恢复
-tar -xzf /root/backup-latest.tar.gz -C /
-
-# 重新生成配置
-xray uuid
-xray x25519
-```
-
-### 3. 系统重装
-```bash
-# 备份重要数据
-tar -czf /root/backup-all.tar.gz /usr/local/etc/xray/ /www/clash/
-
-# 重装系统后恢复
-tar -xzf /root/backup-all.tar.gz -C /
-systemctl restart xray
-```
-
-## 最佳实践
-
-### 1. 文档记录
-每个VPS都应该有记录文档：
-- 服务器信息（IP、端口、密码）
-- 配置参数（UUID、密钥、端口）
-- 变更历史
-- 问题记录
-
-### 2. 定期维护
-- 每月检查系统更新
-- 每季度更新Xray版本
-- 定期备份配置文件
-
-### 3. 安全审计
-- 定期检查登录日志
-- 监控异常流量
-- 及时更新密码
-
-## 快速参考
-
-### 常用命令
-```bash
-# Xray管理
-systemctl status xray
-systemctl restart xray
-journalctl -u xray -f
-
-# 配置检查
-xray run -test -c /usr/local/etc/xray/config.json
-
-# 端口检查
-ss -tlnp | grep 443
-
-# 流量监控
-vnstat -l
-iftop -i eth0
-```
-
-### 默认路径
-- Xray配置：`/usr/local/etc/xray/config.json`
-- Xray日志：`/var/log/xray/`
-- 订阅文件：`/www/clash/`
-- 备份文件：`/root/backup-*.tar.gz`
-
-### 默认端口
-- SSH：22
-- Xray：443
-- HTTP订阅：8080
-- Clash代理：7890
+1. **NAT小鸡**：必须确认端口映射
+2. **1GB硬盘**：加 `--without-geodata`
+3. **IPv6-only**：先装WARP
+4. **共享IP**：注意邻居风险
